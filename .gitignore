@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# VS Code
+.vscode/
+
+# Dados e chaves
+.env
+*.pdf
+chroma_index/

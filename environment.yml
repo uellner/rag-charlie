@@ -1,0 +1,16 @@
+name: ielb_poc
+dependencies:
+  - python=3.12
+  - pip
+  - pymupdf
+  - python-dotenv
+  - pip:
+      - langchain-community
+      - langchain-core
+      - langchain-openai
+      - langchain-text-splitters
+      - langchain-experimental
+      - chromadb
+      - ragas
+      - datasets
+      - evaluate
