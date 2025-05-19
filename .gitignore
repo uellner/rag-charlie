@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 env/
 venv/
+.DS_Store
 
 # VS Code
 .vscode/
