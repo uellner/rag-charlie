@@ -11,6 +11,10 @@ from langchain.globals import set_llm_cache
 from dotenv import load_dotenv
 import os
 import uuid
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import time
+import requests
 
 from ragas.metrics import (
     faithfulness,
@@ -33,6 +37,7 @@ class NewRAGPipeline:
         self.pdf_path = pdf_path  # Ruta al PDF con los textos
         self.chroma_dir = chroma_dir  # Directorio donde se guardará el índice vectorial
         self.api_key = os.getenv("OPENAI_API_KEY")  # Clave de API de OpenAI desde el .env
+        self.api_key_heygen = os.getenv("HEYGEN_API_KEY")  # Clave de API de HeyGen desde el .env
 
         # Modelo de embeddings de OpenAI
         self.embedding_model = OpenAIEmbeddings(
@@ -95,6 +100,39 @@ class NewRAGPipeline:
             chunk_overlap=200,
         )
         return splitter.split_documents(docs)
+    
+    def split_documents_chunks(self, docs):
+        """
+        Divide os documentos em fragmentos maiores (chunks) com base no tamanho do texto.
+        """
+        chunks = []
+        
+        for doc in docs:
+            doc_content = doc.page_content
+            
+            # Vamos aumentar o tamanho do chunk para 3000 caracteres
+            doc_chunks = [doc_content[i:i+3000] for i in range(0, len(doc_content), 3000)]  # Blocos de 3000 caracteres
+            
+            # Filtra os chunks para garantir que o tamanho seja adequado
+            chunks.extend([chunk for chunk in doc_chunks if len(chunk) > 200])  # Chunks com mais de 200 caracteres
+        
+        return chunks
+    
+    # def split_documents_by_sentences(self, docs):
+    #     """
+    #     Divide os documentos em chunks por sentenças, o que pode gerar fragmentos mais significativos.
+    #     """
+    #     sentence_splitter = SentenceTextSplitter(
+    #         chunk_size=2000,  # Tamanho maior para a sentença
+    #         chunk_overlap=400,  # Sobreposição entre os chunks
+    #     )
+        
+    #     all_chunks = []
+    #     for doc in docs:
+    #         doc_chunks = sentence_splitter.split_text(doc.page_content)
+    #         all_chunks.extend(doc_chunks)
+        
+    #     return all_chunks
     
     def split_documents_semantic(self, docs):
         """
@@ -174,11 +212,9 @@ class NewRAGPipeline:
             try:
                 docs = self.retriever.invoke(question_dict["question"])
                 print(f"\n🔍 Documentos recuperados: {len(docs)}")
-                # for i, doc in enumerate(docs):
-                #     print(f"\n--- Documento {i+1} ---\n{doc.page_content[:500]}\n...")
 
                 context = "\n\n".join([doc.page_content for doc in docs])
-                print(f"\n📄 Contexto final com {len(context)} caracteres")
+                # print(f"\n📄 Contexto final com {len(context)} caracteres")
                 return context
             except Exception as e:
                 print(f"❌ Erro ao recuperar/formatar contexto: {e}")
@@ -198,19 +234,6 @@ class NewRAGPipeline:
             | StrOutputParser()  # Convierte la respuesta en una cadena
         )
 
-
-    # def run(self, question: str):
-    #     """
-    #     Ejecuta toda la pipeline: carga documentos, indexa, busca y responde a la pregunta.
-    #     """
-    #     context_docs = self.retriever.invoke(question)  # Recupera los documentos relevantes
-    #     print(f"Documentos recuperados: {len(context_docs)}")  # Imprime la cantidad de documentos recuperados
-
-    #     chain = self.build_chain()
-        
-    #     result = chain.invoke({"question": question})  # 6. Ejecuta con la pregunta
-    #     return result, context_docs
-
     def run(self, question: str):
         
         def perturbar_pergunta(question: str) -> str:
@@ -227,41 +250,139 @@ class NewRAGPipeline:
             print(f"❌ Erro no run: {e}")
             return "Ocorreu um erro ao tentar responder sua pergunta.", []
 
+    # Função para calcular a similaridade entre a pergunta e os documentos
+    def calculate_similarity(self, question, context_docs):
+        """
+        Calcula a similaridade entre a pergunta e os documentos fornecidos.
+        """
+        # Obter os embeddings da pergunta (certifique-se de que seja uma matriz 2D)
+        question_embedding = self.embedding_model.embed_query(question)  # Obtém o embedding da pergunta
+        question_embedding = np.array(question_embedding).reshape(1, -1)  # Reformata para 2D (1, n_features)
+
+        # Obter os embeddings dos documentos (também em 2D)
+        doc_embeddings = self.embedding_model.embed_documents([doc.page_content for doc in context_docs])  # Embeddings dos documentos
+        doc_embeddings = np.array(doc_embeddings)  # Garante que seja um array numpy
+        doc_embeddings = doc_embeddings.reshape(len(doc_embeddings), -1)  # Reformata para 2D
+
+        similarities = []
+        for doc_embedding in doc_embeddings:
+            # Calcular a similaridade de cosseno entre a pergunta e o documento
+            sim_score = cosine_similarity(question_embedding, doc_embedding.reshape(1, -1))  # Reformata o doc_embedding para 2D
+            similarities.append(sim_score[0][0])  # Similaridade em si (valor único)
+
+        return similarities
     
+    def print_docs_with_scores(self, context_docs, similarities):
+        # Adicionar a pontuação nos documentos
+        for i, doc in enumerate(context_docs):
+            doc.metadata['score'] = similarities[i]  # Adicionando a pontuação de similaridade no metadado
 
-    def run_with_eval(self, question: str, ground_truth: str):
+        # Ordenar os documentos pela similaridade (pontuação mais alta primeiro)
+        context_docs_sorted = sorted(context_docs, key=lambda x: x.metadata['score'], reverse=True)
+
+        # Exibir os top-n documentos mais relevantes
+        n = 3  # Número de documentos a exibir
+        for i, doc in enumerate(context_docs_sorted[:n]):
+            print(f"\n--- Document {i+1} ---")
+            print(f"Similarity Score: {doc.metadata['score']}")
+            print(doc.page_content)  # Exibe o conteúdo do documento
+
+    def generar_video_heygen(self, texto, avatar_id):
+        url = "https://api.heygen.com/v2/video/generate"
+        headers = {
+            'X-Api-Key': self.api_key_heygen,
+            'Content-Type': 'application/json'
+        }
+        data = {
+            "video_inputs": [
+                {
+                    "character": {
+                        "type": "avatar",
+                        # "avatar_id": "Daisy-inskirt-20220818",
+                        "avatar_id": avatar_id,  # Usa el avatar_id proporcionado
+                        "avatar_style": "normal"
+                    },
+                    "voice": {
+                        "type": "text",
+                        "input_text": texto,
+                        # "voice_id": "2d5b0e6cf36f460aa7fc47e3eee4ba54"
+                        "voice_id": "789278f26ffd4f2b833f348e76f3c4bc"  # Usa una voz en español
+                    },
+                    "background": {
+                        "type": "color",
+                        "value": "#080808"
+                    }
+                }
+            ],
+            "dimension": {
+                "width": 1280,
+                "height": 720
+            }
+        }
+        r = requests.post(url, json=data, headers=headers)
+        # print(f"Status Code: {r.status_code}")
+        # print(r.json())
+        if r.status_code == 200:
+            print("\n✅ Vídeo enviado para generación!")
+            video_request_id = r.json()["data"]["video_id"]
+            self.wait_for_video(video_request_id=video_request_id)  # Espera hasta que el video esté listo
+        else:
+            print("\n❌ Error al enviar el vídeo para generación.")
+            print(f"Mensaje de error: {r.json().get('message', 'No se proporcionó mensaje de error')}")
+
+
+    def wait_for_video(self, video_request_id):
         """
-        Ejecuta la pipeline y evalúa la respuesta generada con base en métricas de RAG.
+        Espera hasta que el video esté listo.
         """
-        # Ejecuta la pipeline
-        answer, context_docs = self.run(question)
-
-        # Extrae el texto de los documentos recuperados
-        context_strings = [doc.page_content for doc in context_docs]
-
-        example = {
-            "question": question,
-            "contexts": context_strings,
-            "answer": answer,
+        url = f"https://api.heygen.com/v1/video_status.get?video_id={video_request_id}"
+        headers = {
+            'X-Api-Key': self.api_key_heygen,
+            'Content-Type': 'application/json'
         }
 
-        if ground_truth:
-            example["ground_truth"] = ground_truth
+        start_time = time.time()
+        
+        while True:
+            response = requests.get(url, headers=headers)
+            data = response.json()
+            status = data.get("data", {}).get("status")
+            if response.status_code == 200:
+                if status == "completed":
+                    video_url = data["data"].get("video_url")
 
-        # Crea el dataset para evaluación
-        dataset = HFDataset.from_list([example])
+                    end_time = time.time()  # Marca o fim do processo
+                    total_time = end_time - start_time
 
-        # Evalúa la respuesta con las métricas de RAGAS
-        metrics = evaluate(
-            dataset,
-            metrics=[
-                faithfulness,
-                answer_relevancy,
-                context_recall,
-                context_precision,
-            ]
-        )
-        return answer, metrics
+                    print("\n✅ El video está listo!")
+                    print(f"\n⏱ Tiempo total de generación: {total_time:.2f} segundos")
+                    print(f"\n🎥 Link del vídeo: {video_url}")
+                    break
+                elif status == "failed":
+                    print("\n❌ La generación del vídeo ha fallado.")
+                    break
+                else:
+                    print("\n⏳ El video aún se está procesando. Esperando...")
+                    time.sleep(30)
+
+    def print_answer(self, answer: str, context_docs: list = None):
+        """
+        Imprime la respuesta generada por el modelo.
+        """
+        if context_docs:
+            for i, doc in enumerate(context_docs):
+                print(f"\n--- Documento {i+1} ---")
+                
+                score = doc.metadata.get('score', 'Pontuação não disponível')
+                print(f"Pontuação de Similaridade: {score}")
+    
+                # Dividindo o conteúdo em partes menores, como por exemplo linhas
+                chunks = doc.page_content.split("\n")  # Separando por linhas
+                top_chunks = chunks[:3]  # Exemplo: pegando os 3 primeiros trechos
+                
+                for chunk in top_chunks:
+                    print(chunk)
+        print(f"\n\n-> {answer}\n")
     
 if __name__ == "__main__":
 
@@ -287,16 +408,46 @@ if __name__ == "__main__":
         
         try:
             answer, context_docs = pipeline.run(question)
+            
+            # Divide os documentos em chunks com base na função `split_documents_character`
+            # chunks = pipeline.split_documents_by_sentences(context_docs)
+
+            # Calcula a similaridade entre a pergunta e os documentos
+            # similarities = pipeline.calculate_similarity(question, context_docs)
+
+            # Adiciona a pontuação de similaridade nos documentos
+            # for i, doc in enumerate(context_docs):
+            #     doc.metadata['score'] = similarities[i]  # Adiciona a pontuação no metadado
+
+            # Ordena os documentos pela similaridade (pontuação mais alta primeiro)
+            # context_docs_sorted = sorted(context_docs, key=lambda x: x.metadata['score'], reverse=True)
+
+            # Exibe os top-n documentos mais relevantes
+            # n = 3  # Número de documentos a exibir
+            # for i, doc in enumerate(context_docs_sorted[:n]):  # Exibe apenas os top-n documentos
+            #     print(f"\n--- Documento {i+1} ---")
+            #     print(f"Pontuação de Similaridade: {doc.metadata.get('score', 'Pontuação não disponível')}")
+                
+            #     # Se a segmentação foi feita corretamente, "doc_chunks" deve ser uma lista com o conteúdo do documento dividido
+            #     doc_chunks = chunks[i]  # Associa os chunks ao documento correto
+            #     print(f"\nChunks para o Documento {i+1}:")
+                
+            #     # Exibe os primeiros 3 chunks, ou todos se houver menos de 3
+            #     top_chunks = doc_chunks[:3]  # Limita para os 3 primeiros, ou todos se houver menos de 3
+            #     for j, chunk in enumerate(top_chunks):
+            #         print(f"\nTrecho {j+1}:")
+            #         print(chunk)  # Exibe o trecho
+
+            # # Teste de chunks gerados (Exibe os chunks)
+            # print("Chunks gerados:")
+            # for i, doc in enumerate(chunks[:n]):
+            #     print(f"\nDocumento {i+1}:")
+            #     for j, chunk in enumerate(doc[:3]):  # Apenas 3 primeiros, ou menos, se houver
+            #         print(f"Trecho {j+1}: {chunk}")
+
+            # pipeline.print_answer(answer, context_docs)  # Imprime la respuesta y el contexto recuperado
             print(f"\n\n-> {answer}\n")
+            pipeline.generar_video_heygen(texto=answer, avatar_id="d76db879fb5848a4b0729f88499fec48")  # Genera el video con HeyGen
         except Exception as e:
             print(f"\n\n- Error al procesar la pregunta: {e}\n")
         # print(f"- Context_Docs: {context_docs}\n")
-
-    # Evaluación
-    # answer, metrics = pipeline.run_with_eval(
-    #     question=question,
-    #     ground_truth=evaluation_examples[0]["ground_truth"]
-    # )
-    # print(f"\n\n- Pregunta: {question}")
-    # print(f"- Respuesta: {answer}")
-    # print(f"- Métricas: {metrics}\n")
